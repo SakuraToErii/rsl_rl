@@ -6,7 +6,7 @@
 """Definitions for neural-network components for RL-agents."""
 
 from .actor_critic import ActorCritic
-from .actor_critic_mha import ActorCriticMHA
+from .actor_critic_mha import ActorCriticMHA  # MHA 历史编码器变体（本次移植新增）；导出后 eval(class_name) 可解析
 from .actor_critic_recurrent import ActorCriticRecurrent
 from .rnd import *
 from .student_teacher import StudentTeacher

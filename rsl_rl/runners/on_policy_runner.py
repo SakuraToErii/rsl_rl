@@ -15,6 +15,7 @@ from collections import deque
 import rsl_rl
 from rsl_rl.algorithms import PPO
 from rsl_rl.env import VecEnv
+# ActorCriticMHA 为本次 MHA 移植新增；runner 用 eval(class_name) 实例化策略类，需在此 import 使名字可见
 from rsl_rl.modules import ActorCritic, ActorCriticMHA, ActorCriticRecurrent, resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.utils import resolve_obs_groups, store_code_state
 

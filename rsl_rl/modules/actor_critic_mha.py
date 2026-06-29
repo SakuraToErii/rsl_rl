@@ -6,70 +6,88 @@ from torch.distributions import Normal
 
 from rsl_rl.modules.actor_critic import ActorCritic
 from rsl_rl.networks import MLP, EmpiricalNormalization
-from rsl_rl.networks.mha import AvgL1Norm, LinearMHAEncoder
+from rsl_rl.networks.mha import AvgL1Norm, LinearMHAEncoder, to_time_major
 from rsl_rl.utils import resolve_nn_activation
 
 
 class MHAActor(nn.Module):
-    """Actor trunk conditioned on an MHA history embedding ``z``.
+    """以 MHA 历史 embedding ``z`` 为条件的 actor 主干。
 
-    Mirrors ``ours/fast_td3_mha_mask.py:Actor``: ``cat([AvgL1Norm(l0(obs_flat)), z])``
-    then an MLP head. The encoder consumes the term-major flat obs directly and
-    does the time-major reshape internally. Outputs the action mean (unbounded;
-    rsl_rl keeps an unbounded Gaussian and the env clips actions).
+    4+1 分叉：对 term-major 扁平历史先 ``to_time_major`` 成 ``[B, H, D]``（time-major），
+    切出 **当前帧** ``[B, D]`` 喂旁路 ``l0``，**过去帧** ``[B, H-1, D]`` 喂
+    ``LinearMHAEncoder``。两路 cat 后进 trunk MLP 出动作均值（无界；rsl_rl 保持
+    无界高斯，动作由环境 clip）。
+
+    对应 ``ours/fast_td3_mha_mask.py:Actor`` 的分工：``l0`` 只压当前状态，
+    ``z`` 只编过去时序——原版 obs 和 z 是两路独立输入，这里统一从 term-major
+    扁平 obs 内部切分。
     """
 
-    def __init__(self, num_obs, num_actions, n_history, term_dims, enc_hidden,
+    def __init__(self, term_dims, num_actions, n_history, enc_hidden,
                  nheads, pos_emb, hidden_dims, activation):
         super().__init__()
         actv = resolve_nn_activation(activation)
+        self.n_history = n_history                         # 环境扁平帧数 H（如 5）
+        self.term_dims = list(term_dims)                   # 各 term 单步维度
+        self.single_dim = int(sum(self.term_dims))         # 单帧观测总维度 D
+
+        n_past = n_history - 1                             # 过去帧数
         self.encoder = LinearMHAEncoder(
-            term_dims=term_dims, n_history=n_history, hidden_dim=enc_hidden,
+            input_dim=self.single_dim, n_history=n_past, hidden_dim=enc_hidden,
             nhead=nheads, is_learnable_pos_embedding=pos_emb, actv=actv,
-        )
-        self.l0 = nn.Linear(num_obs, enc_hidden)
+        )                                                  # 过去帧编码器 -> z [B, enc_hidden]
+        self.l0 = nn.Linear(self.single_dim, enc_hidden)   # 当前帧旁路投影 D -> enc_hidden
         self.trunk = MLP(2 * enc_hidden, num_actions, hidden_dims, activation)
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        z = self.encoder(obs)
-        h = AvgL1Norm(self.l0(obs))
-        return self.trunk(torch.cat([h, z], dim=-1))
+        # obs: [B, H*D] term-major 扁平历史
+        x = to_time_major(obs, self.term_dims, self.n_history)  # [B, H, D]
+        cur = x[:, -1, :]        # 当前帧  [B, D]
+        past = x[:, :-1, :]      # 过去帧  [B, H-1, D]
+        z = self.encoder(past)                                   # 历史注意力摘要
+        h = AvgL1Norm(self.l0(cur))                              # 当前帧旁路，自归一化
+        return self.trunk(torch.cat([h, z], dim=-1))             # 拼两路进 MLP -> 动作均值
 
 
 class MHACritic(nn.Module):
-    """Value trunk conditioned on an MHA history embedding (same shape as ``MHAActor``)."""
+    """以 MHA 历史 embedding 为条件的 value 主干（4+1 分叉，与 MHAActor 结构一致，输出 1 维）。"""
 
-    def __init__(self, num_obs, n_history, term_dims, enc_hidden, nheads, pos_emb,
+    def __init__(self, term_dims, n_history, enc_hidden, nheads, pos_emb,
                  hidden_dims, activation):
         super().__init__()
         actv = resolve_nn_activation(activation)
+        self.n_history = n_history
+        self.term_dims = list(term_dims)
+        self.single_dim = int(sum(self.term_dims))
+
+        n_past = n_history - 1
         self.encoder = LinearMHAEncoder(
-            term_dims=term_dims, n_history=n_history, hidden_dim=enc_hidden,
+            input_dim=self.single_dim, n_history=n_past, hidden_dim=enc_hidden,
             nhead=nheads, is_learnable_pos_embedding=pos_emb, actv=actv,
         )
-        self.l0 = nn.Linear(num_obs, enc_hidden)
+        self.l0 = nn.Linear(self.single_dim, enc_hidden)   # 当前帧旁路投影
         self.trunk = MLP(2 * enc_hidden, 1, hidden_dims, activation)
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        z = self.encoder(obs)
-        h = AvgL1Norm(self.l0(obs))
+        x = to_time_major(obs, self.term_dims, self.n_history)  # [B, H, D]
+        cur = x[:, -1, :]        # 当前帧  [B, D]
+        past = x[:, :-1, :]      # 过去帧  [B, H-1, D]
+        z = self.encoder(past)
+        h = AvgL1Norm(self.l0(cur))
         return self.trunk(torch.cat([h, z], dim=-1))
 
 
 class ActorCriticMHA(ActorCritic):
-    """``ActorCritic`` with an MHA history encoder on the actor (always) and
-    optionally on the critic (``use_critic_mha``).
+    """带 MHA 历史编码器的 ActorCritic：actor 必带 MHA，critic 可选（``use_critic_mha``）。
 
-    Drop-in replacement for ``ActorCritic``: same ``__init__`` surface plus the
-    MHA parameters. ``act`` / ``evaluate`` / ``update_distribution`` / ... are
-    inherited unchanged -- the encoder is folded inside ``self.actor`` /
-    ``self.critic``, so the base methods (which call ``self.actor(obs)`` /
-    ``self.critic(obs)`` on the normalized flat obs) work as-is.
+    内部采用 4+1 分叉：当前帧走旁路 ``l0``，过去帧走 ``LinearMHAEncoder``，两路 cat
+    后进 trunk MLP。``ActorCritic`` 的 drop-in 替换：``__init__`` 接口一致，外加 MHA
+    参数。``act`` / ``evaluate`` / ``update_distribution`` 等全部继承不改——encoder 折进
+    ``self.actor`` / ``self.critic``，基类方法调 ``self.actor(obs)`` 照常工作。
 
-    ``actor_term_dims`` / ``critic_term_dims`` must match the env's obs term
-    layout. For G1-29dof velocity:
-      actor  = ``[3, 3, 3, 29, 29, 29]`` (96 single-step x 5 = 480),
-      critic = ``[3, 3, 3, 3, 29, 29, 29]`` (99 single-step x 5 = 495).
+    ``actor_term_dims`` / ``critic_term_dims`` 必须与环境 obs term 布局一致。G1-29dof velocity：
+      actor  = ``[3, 3, 3, 29, 29, 29]``（单步 96，5 帧扁平 480），
+      critic = ``[3, 3, 3, 3, 29, 29, 29]``（单步 99，5 帧扁平 495）。
     """
 
     def __init__(
@@ -98,9 +116,8 @@ class ActorCriticMHA(ActorCritic):
                 "ActorCriticMHA.__init__ got unexpected arguments, which will be ignored: "
                 + str(list(kwargs.keys()))
             )
-        # Build normalizers, std and the distribution placeholder via the base
-        # class. The base also builds plain-MLP self.actor / self.critic, which
-        # we overwrite below with the MHA variants.
+        # 先走基类 __init__：建归一化器、std、分布占位，以及普通 MLP 的 self.actor /
+        # self.critic。下面用 MHA 版本覆盖掉它们。
         super().__init__(
             obs,
             obs_groups,
@@ -120,14 +137,10 @@ class ActorCriticMHA(ActorCritic):
                 "(per-term single-step dims of the env's obs groups)."
             )
 
-        # Base computed these locally but did not store them; recompute here.
-        num_actor_obs = sum(obs[g].shape[-1] for g in obs_groups["policy"])
-        num_critic_obs = sum(obs[g].shape[-1] for g in obs_groups["critic"])
-
         enc_hidden_a = encoder_hidden_dim if encoder_hidden_dim is not None else actor_hidden_dims[0] // 2
         self.actor = MHAActor(
-            num_obs=num_actor_obs, num_actions=num_actions,
-            n_history=n_history, term_dims=actor_term_dims, enc_hidden=enc_hidden_a,
+            term_dims=actor_term_dims, num_actions=num_actions,
+            n_history=n_history, enc_hidden=enc_hidden_a,
             nheads=nheads, pos_emb=is_learnable_pos_embedding,
             hidden_dims=actor_hidden_dims, activation=activation,
         )
@@ -135,11 +148,11 @@ class ActorCriticMHA(ActorCritic):
         if use_critic_mha:
             enc_hidden_c = encoder_hidden_dim if encoder_hidden_dim is not None else critic_hidden_dims[0] // 2
             self.critic = MHACritic(
-                num_obs=num_critic_obs, n_history=n_history, term_dims=critic_term_dims,
+                term_dims=critic_term_dims, n_history=n_history,
                 enc_hidden=enc_hidden_c, nheads=nheads, pos_emb=is_learnable_pos_embedding,
                 hidden_dims=critic_hidden_dims, activation=activation,
             )
-        # else: keep the base plain-MLP self.critic.
+        # 否则保留基类的普通 MLP self.critic（critic 不走 MHA）。
 
         print(f"Actor MHA: {self.actor}")
         print(f"Critic {'MHA' if use_critic_mha else 'MLP'}: {self.critic}")
