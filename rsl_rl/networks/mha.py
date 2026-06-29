@@ -51,7 +51,7 @@ def to_time_major(obs_flat: torch.Tensor, term_dims, n_history: int) -> torch.Te
 
 
 class LinearMHAEncoder(nn.Module):
-    """MHA 历史编码器：对过去帧做 self-attention 再均值池化，输出定长 embedding ``z``。
+    """MHA 历史编码器：对过去帧做 self-attention residual block，再均值池化输出 ``z``。
 
     term-major -> time-major reshape 已上提到 MHAActor / MHACritic 的 forward 中；
     本编码器直接接收已切出的过去帧 ``[B, H_past, D]``（time-major），不再做 reshape。
@@ -68,26 +68,34 @@ class LinearMHAEncoder(nn.Module):
         hidden_dim: int,
         nhead: int,
         is_learnable_pos_embedding: bool = True,
+        dropout: float = 0.0,
         actv=F.elu,
     ):
         super().__init__()
+        if dropout < 0.0 or dropout >= 1.0:
+            raise ValueError(f"dropout must be in [0, 1), got {dropout}")
         self.input_dim = input_dim
         self.n_history = n_history
         self.proj = nn.Linear(input_dim, hidden_dim)          # 单帧线性投影 D -> hidden_dim
         self.actv = actv
+        self.dropout = nn.Dropout(dropout)
         self.pos = (
             nn.Parameter(torch.zeros(1, n_history, hidden_dim))
             if is_learnable_pos_embedding
             else None
         )                              # 可学位置编码；attention 排列不变，需显式补时序
-        self.mha = nn.MultiheadAttention(hidden_dim, nhead, batch_first=True)
+        self.mha = nn.MultiheadAttention(hidden_dim, nhead, dropout=dropout, batch_first=True)
+        self.norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: ``[B, H_past, D]`` 过去帧序列（time-major，已由调用方切出当前帧）。"""
-        h = self.proj(x)                                         # [B, H_past, hidden_dim]
+        h = self.proj(x)                # [B, H_past, hidden_dim]
         if self.actv is not None:
             h = self.actv(h)
+        h = self.dropout(h)
         if self.pos is not None:
-            h = h + self.pos[:, : h.shape[1], :]                 # 加位置编码
-        h2, _ = self.mha(h, h, h, need_weights=False)            # [B, H_past, hidden_dim]
-        return h2.mean(dim=1)                                    # [B, hidden_dim]，对过去帧均值池化
+            h = h + self.pos[:, : h.shape[1], :]     # 加位置编码
+        h_normed = self.norm(h)                                   # Pre-LN
+        h2, _ = self.mha(h_normed, h_normed, h_normed, need_weights=False)  # [B, H_past, hidden_dim]
+        h = h + self.dropout(h2)                               # residual
+        return h.mean(dim=1)                                     # [B, hidden_dim]，对过去帧均值池化
