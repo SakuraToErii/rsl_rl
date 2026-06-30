@@ -1,4 +1,4 @@
-# 历史观测的 multi-head attention 工具（编码器、归一化、reshape）。
+# 历史观测的 multi-head attention 工具（编码器、位置编码、reshape）。
 #
 # 4+1 分叉结构：to_time_major 把环境 term-major 扁平历史 reshape 成 [B, H, D]，
 # 调用方切出过去帧 [B, H-1, D] 喂 encoder，当前帧 [B, D] 单独喂旁路 l0。
@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import List
 
 import torch
@@ -14,9 +15,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def AvgL1Norm(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """自归一化激活：除以最后一维绝对值的均值。"""
-    return x / x.abs().mean(-1, keepdim=True).clamp(min=eps)
+def _sinusoidal_pe(n_positions: int, dim: int) -> torch.Tensor:
+    """标准 sinusoidal 位置编码，shape ``[1, n_positions, dim]``。
+
+    给可学位置编码一个带时间结构的初始化（替代零初始化）：step 0 各位置就已可
+    区分，attention 不会在第 0 步位置盲。仍是 ``nn.Parameter``，网络后续可自由调整。
+    """
+    pe = torch.zeros(n_positions, dim)
+    position = torch.arange(n_positions, dtype=torch.float32).unsqueeze(1)
+    div_term = torch.exp(
+        torch.arange(0, dim, 2, dtype=torch.float32) * (-math.log(10000.0) / dim)
+    )
+    pe[:, 0::2] = torch.sin(position * div_term)
+    n_cos = pe[:, 1::2].shape[1]
+    pe[:, 1::2] = torch.cos(position * div_term[:n_cos])
+    return pe.unsqueeze(0)
 
 
 def to_time_major(obs_flat: torch.Tensor, term_dims: List[int], n_history: int) -> torch.Tensor:
@@ -53,7 +66,7 @@ def to_time_major(obs_flat: torch.Tensor, term_dims: List[int], n_history: int) 
 
 
 class LinearMHAEncoder(nn.Module):
-    """MHA 历史编码器：对过去帧做 self-attention residual block，再均值池化输出 ``z``。
+    """MHA 历史编码器：对过去帧做 self-attention residual block，取最近一帧输出 ``z``。
 
     term-major -> time-major reshape 已上提到 MHAActor / MHACritic 的 forward 中；
     本编码器直接接收已切出的过去帧 ``[B, H_past, D]``（time-major），不再做 reshape。
@@ -62,7 +75,12 @@ class LinearMHAEncoder(nn.Module):
     对应 ``ours/fast_td3_mha_mask.py:LinearMHAEncoder``：去掉 mask / SOS 分支（环境会
     把槽填满），去掉 term-major reshape（调用方负责）。
     输入维度：``[B, H_past, D]``
-    输出维度：``[B, hidden_dim]``，对过去帧均值池化。
+    输出维度：``[B, hidden_dim]``，取经过 self-attention 后的 t-1 token（last-token pooling）。
+
+    last-token pooling：注意力双向无 mask，``h[:, -1, :]`` 已 attend 过全部过去帧，是
+    "带完整历史上下文的最近过去帧 token"，保留 recency；mean pooling 会把位置特异性
+    信号平均稀释。``out_norm`` 对残差流做最终 LayerNorm，与调用方旁路的 ``cur_norm``
+    对称，保证两路尺度一致。
     """
 
     def __init__(
@@ -80,12 +98,13 @@ class LinearMHAEncoder(nn.Module):
         self.proj = nn.Linear(input_dim, hidden_dim)          # 单帧线性投影 D -> hidden_dim
         self.actv = actv
         self.pos = (
-            nn.Parameter(torch.zeros(1, n_history, hidden_dim))
+            nn.Parameter(_sinusoidal_pe(n_history, hidden_dim))
             if is_learnable_pos_embedding
             else None
-        )                              # 可学位置编码；attention 排列不变，需显式补时序
+        )                              # 可学位置编码，sinusoidal 初始化补时序结构；attention 排列不变，需显式补时序
         self.mha = nn.MultiheadAttention(hidden_dim, nhead, batch_first=True)
-        self.norm = nn.LayerNorm(hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)          # Pre-LN（attention 前）
+        self.out_norm = nn.LayerNorm(hidden_dim)      # 残差流最终归一化，与调用方旁路 cur_norm 对称
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: ``[B, H_past, D]`` 过去帧序列（time-major，已由调用方切出当前帧）。"""
@@ -96,5 +115,5 @@ class LinearMHAEncoder(nn.Module):
             h = h + self.pos[:, : h.shape[1], :]     # 加位置编码
         h_normed = self.norm(h)                                   # Pre-LN
         h2, _ = self.mha(h_normed, h_normed, h_normed, need_weights=False)  # [B, H_past, hidden_dim]
-        h = h + h2                                               # residual
-        return h.mean(dim=1)                                     # [B, hidden_dim]，对过去帧均值池化
+        h = self.out_norm(h + h2)                                # residual + 最终归一化
+        return h[:, -1, :]                                       # [B, hidden_dim]，last-token pooling（t-1，带历史上下文）

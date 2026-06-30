@@ -6,7 +6,7 @@ from torch.distributions import Normal
 
 from rsl_rl.modules.actor_critic import ActorCritic
 from rsl_rl.networks import MLP, EmpiricalNormalization
-from rsl_rl.networks.mha import AvgL1Norm, LinearMHAEncoder, to_time_major
+from rsl_rl.networks.mha import LinearMHAEncoder, to_time_major
 from rsl_rl.utils import resolve_nn_activation
 
 
@@ -27,6 +27,7 @@ class MHAActor(nn.Module):
                  nheads, pos_emb, hidden_dims, activation):
         super().__init__()
         actv = resolve_nn_activation(activation)
+        self.actv = actv                            # 当前帧旁路复用同激活（与 encoder 的 proj->actv 对称）
         self.n_history = n_history                  # 环境扁平帧数 H（如 5）
         self.term_dims = list(term_dims)            # 各 term 单步维度
         self.single_dim = int(sum(self.term_dims))  # 单帧观测总维度 D
@@ -38,6 +39,7 @@ class MHAActor(nn.Module):
             nhead=nheads, is_learnable_pos_embedding=pos_emb, actv=actv,
         )                                          # 过去帧编码器 -> z [B, enc_hidden]
         self.l0 = nn.Linear(self.single_dim, enc_hidden)   # 当前帧旁路投影 D -> enc_hidden
+        self.cur_norm = nn.LayerNorm(enc_hidden)            # 当前帧旁路归一化，与 encoder.out_norm 对称
         self.trunk = MLP(2 * enc_hidden, num_actions, hidden_dims, activation)
 
     def __getitem__(self, index: int):
@@ -52,7 +54,10 @@ class MHAActor(nn.Module):
         cur = x[:, -1, :]        # 当前帧  [B, D]
         past = x[:, :-1, :]      # 过去帧  [B, H-1, D]
         z = self.encoder(past)                                   # 历史注意力摘要
-        h = AvgL1Norm(self.l0(cur))                              # 当前帧旁路，自归一化
+        h = self.l0(cur)                                         # 当前帧旁路：Linear -> actv -> LayerNorm（与 encoder proj -> actv -> norm 对称）
+        if self.actv is not None:
+            h = self.actv(h)
+        h = self.cur_norm(h)
         return self.trunk(torch.cat([h, z], dim=-1))             # 拼两路进 MLP -> 动作均值
 
 
@@ -63,6 +68,7 @@ class MHACritic(nn.Module):
                  hidden_dims, activation):
         super().__init__()
         actv = resolve_nn_activation(activation)
+        self.actv = actv                            # 当前帧旁路复用同激活（与 encoder 的 proj->actv 对称）
         self.n_history = n_history
         self.term_dims = list(term_dims)
         self.single_dim = int(sum(self.term_dims))
@@ -73,6 +79,7 @@ class MHACritic(nn.Module):
             nhead=nheads, is_learnable_pos_embedding=pos_emb, actv=actv,
         )
         self.l0 = nn.Linear(self.single_dim, enc_hidden)   # 当前帧旁路投影
+        self.cur_norm = nn.LayerNorm(enc_hidden)            # 当前帧旁路归一化，与 encoder.out_norm 对称
         self.trunk = MLP(2 * enc_hidden, 1, hidden_dims, activation)
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
@@ -80,7 +87,10 @@ class MHACritic(nn.Module):
         cur = x[:, -1, :]        # 当前帧  [B, D]
         past = x[:, :-1, :]      # 过去帧  [B, H-1, D]
         z = self.encoder(past)
-        h = AvgL1Norm(self.l0(cur))
+        h = self.l0(cur)
+        if self.actv is not None:
+            h = self.actv(h)
+        h = self.cur_norm(h)
         return self.trunk(torch.cat([h, z], dim=-1))
 
 
