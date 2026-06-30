@@ -24,20 +24,27 @@ class MHAActor(nn.Module):
     """
 
     def __init__(self, term_dims, num_actions, n_history, enc_hidden,
-                 nheads, pos_emb, dropout, hidden_dims, activation):
+                 nheads, pos_emb, hidden_dims, activation):
         super().__init__()
         actv = resolve_nn_activation(activation)
         self.n_history = n_history                  # 环境扁平帧数 H（如 5）
         self.term_dims = list(term_dims)            # 各 term 单步维度
         self.single_dim = int(sum(self.term_dims))  # 单帧观测总维度 D
+        self.in_features = n_history * self.single_dim
 
         n_past = n_history - 1                      # 过去帧数
         self.encoder = LinearMHAEncoder(
             input_dim=self.single_dim, n_history=n_past, hidden_dim=enc_hidden,
-            nhead=nheads, is_learnable_pos_embedding=pos_emb, dropout=dropout, actv=actv,
+            nhead=nheads, is_learnable_pos_embedding=pos_emb, actv=actv,
         )                                          # 过去帧编码器 -> z [B, enc_hidden]
         self.l0 = nn.Linear(self.single_dim, enc_hidden)   # 当前帧旁路投影 D -> enc_hidden
         self.trunk = MLP(2 * enc_hidden, num_actions, hidden_dims, activation)
+
+    def __getitem__(self, index: int):
+        # ponytail: IsaacLab's ONNX exporter reads actor[0].in_features for dummy obs.
+        if index == 0:
+            return self
+        raise IndexError(index)
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         # obs: [B, H*D] term-major 扁平历史
@@ -52,7 +59,7 @@ class MHAActor(nn.Module):
 class MHACritic(nn.Module):
     """以 MHA 历史 embedding 为条件的 value 主干（4+1 分叉，与 MHAActor 结构一致，输出 1 维）。"""
 
-    def __init__(self, term_dims, n_history, enc_hidden, nheads, pos_emb, dropout,
+    def __init__(self, term_dims, n_history, enc_hidden, nheads, pos_emb,
                  hidden_dims, activation):
         super().__init__()
         actv = resolve_nn_activation(activation)
@@ -63,7 +70,7 @@ class MHACritic(nn.Module):
         n_past = n_history - 1
         self.encoder = LinearMHAEncoder(
             input_dim=self.single_dim, n_history=n_past, hidden_dim=enc_hidden,
-            nhead=nheads, is_learnable_pos_embedding=pos_emb, dropout=dropout, actv=actv,
+            nhead=nheads, is_learnable_pos_embedding=pos_emb, actv=actv,
         )
         self.l0 = nn.Linear(self.single_dim, enc_hidden)   # 当前帧旁路投影
         self.trunk = MLP(2 * enc_hidden, 1, hidden_dims, activation)
@@ -106,7 +113,6 @@ class ActorCriticMHA(ActorCritic):
         nheads: int = 4,
         encoder_hidden_dim: int | None = 64,
         is_learnable_pos_embedding: bool = True,
-        encoder_dropout: float = 0.0,
         use_critic_mha: bool = False,
         actor_term_dims: list[int] | None = None,
         critic_term_dims: list[int] | None = None,
@@ -143,7 +149,6 @@ class ActorCriticMHA(ActorCritic):
             term_dims=actor_term_dims, num_actions=num_actions,
             n_history=n_history, enc_hidden=enc_hidden_a,
             nheads=nheads, pos_emb=is_learnable_pos_embedding,
-            dropout=encoder_dropout,
             hidden_dims=actor_hidden_dims, activation=activation,
         )
 
@@ -152,7 +157,6 @@ class ActorCriticMHA(ActorCritic):
             self.critic = MHACritic(
                 term_dims=critic_term_dims, n_history=n_history,
                 enc_hidden=enc_hidden_c, nheads=nheads, pos_emb=is_learnable_pos_embedding,
-                dropout=encoder_dropout,
                 hidden_dims=critic_hidden_dims, activation=activation,
             )
         # 否则保留基类的普通 MLP self.critic（critic 不走 MHA）。

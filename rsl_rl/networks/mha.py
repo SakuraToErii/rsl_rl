@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from typing import List
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,7 +19,7 @@ def AvgL1Norm(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     return x / x.abs().mean(-1, keepdim=True).clamp(min=eps)
 
 
-def to_time_major(obs_flat: torch.Tensor, term_dims, n_history: int) -> torch.Tensor:
+def to_time_major(obs_flat: torch.Tensor, term_dims: List[int], n_history: int) -> torch.Tensor:
     """把 term-major 扁平历史 reshape 成 time-major ``[B, H, sum(term_dims)]``。
 
     环境按 term-major 存历史：每个 term 的 n_history 帧连续（旧 -> 新），再把各 term
@@ -59,6 +61,8 @@ class LinearMHAEncoder(nn.Module):
 
     对应 ``ours/fast_td3_mha_mask.py:LinearMHAEncoder``：去掉 mask / SOS 分支（环境会
     把槽填满），去掉 term-major reshape（调用方负责）。
+    输入维度：``[B, H_past, D]``
+    输出维度：``[B, hidden_dim]``，对过去帧均值池化。
     """
 
     def __init__(
@@ -68,23 +72,19 @@ class LinearMHAEncoder(nn.Module):
         hidden_dim: int,
         nhead: int,
         is_learnable_pos_embedding: bool = True,
-        dropout: float = 0.0,
         actv=F.elu,
     ):
         super().__init__()
-        if dropout < 0.0 or dropout >= 1.0:
-            raise ValueError(f"dropout must be in [0, 1), got {dropout}")
         self.input_dim = input_dim
         self.n_history = n_history
         self.proj = nn.Linear(input_dim, hidden_dim)          # 单帧线性投影 D -> hidden_dim
         self.actv = actv
-        self.dropout = nn.Dropout(dropout)
         self.pos = (
             nn.Parameter(torch.zeros(1, n_history, hidden_dim))
             if is_learnable_pos_embedding
             else None
         )                              # 可学位置编码；attention 排列不变，需显式补时序
-        self.mha = nn.MultiheadAttention(hidden_dim, nhead, dropout=dropout, batch_first=True)
+        self.mha = nn.MultiheadAttention(hidden_dim, nhead, batch_first=True)
         self.norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -92,10 +92,9 @@ class LinearMHAEncoder(nn.Module):
         h = self.proj(x)                # [B, H_past, hidden_dim]
         if self.actv is not None:
             h = self.actv(h)
-        h = self.dropout(h)
         if self.pos is not None:
             h = h + self.pos[:, : h.shape[1], :]     # 加位置编码
         h_normed = self.norm(h)                                   # Pre-LN
         h2, _ = self.mha(h_normed, h_normed, h_normed, need_weights=False)  # [B, H_past, hidden_dim]
-        h = h + self.dropout(h2)                               # residual
+        h = h + h2                                               # residual
         return h.mean(dim=1)                                     # [B, hidden_dim]，对过去帧均值池化
